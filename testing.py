@@ -41,7 +41,7 @@ from skorch import NeuralNetClassifier
     return model
 """
 
-class NeuralNet(nn.Module):
+"""class NeuralNet(nn.Module):
     def __init__(self, width=100, n_vars=6, n_classes=7, conv_kernel_size=5, conv_filters=3, lstm_units=3):
         super(NeuralNet, self).__init__()
 
@@ -69,7 +69,7 @@ class NeuralNet(nn.Module):
 data = load_watch()
 X = data['X']
 X = [elX.astype(np.float32) for elX in X]
-y = data['y']
+y = data['y']"""
 
 """layers = []
 layers.append(nn.Conv1d(100, 200, kernel_size=3, padding='valid'))
@@ -81,7 +81,7 @@ layers.append(nn.Softmax())
 
 net = nn.Sequential(*layers)"""
 
-#nn = NeuralNetClassifier(net, max_epochs=10, lr=0.01, batch_size=12, optimizer=torch.optim.RMSprop)
+"""#nn = NeuralNetClassifier(net, max_epochs=10, lr=0.01, batch_size=12, optimizer=torch.optim.RMSprop)
 
 print(1)
 
@@ -105,4 +105,34 @@ print("Accuracy score: ", score)
 img = mpimg.imread('segments.jpg')
 plt.imshow(img)
 
-print(1)
+print(1)"""
+
+import tsai.all as ts
+import pandas as pd
+ts.computer_setup()
+
+raw_data = pd.read_feather('test_data.feather')
+
+X, y = ts.SlidingWindow(window_len=500, get_x=['magnetic_field_sensor_0_x', 'magnetic_field_sensor_0_y', 'magnetic_field_sensor_0_z', 'pressure_sensor_0_fluid_pressure'], get_y=['ground_truth_direction'],stride=5)(raw_data)
+splits = ts.TrainValidTestSplitter(valid_size=.2, shuffle=True)(y)
+
+tfms  = [None, [ts.Categorize()]]
+dsets = ts.TSDatasets(X, y, tfms=tfms, splits=splits, inplace=True)
+
+dls = ts.TSDataLoaders.from_dsets(dsets.train, dsets.valid, bs=[64, 128], batch_tfms=[ts.TSStandardize()], num_workers=0)
+
+model = ts.InceptionTime(dls.vars, dls.c)
+
+learn = ts.Learner(dls, model, metrics=ts.accuracy)
+learn.fit_one_cycle(25, lr_max=1e-3)
+learn.plot_metrics()
+
+#dsid = 'NATOPS'
+#X, y, splits = get_UCR_data(dsid, return_split=False)
+#tfms  = [None, [Categorize()]]
+#dsets = TSDatasets(X, y, tfms=tfms, splits=splits, inplace=True)
+#dls   = TSDataLoaders.from_dsets(dsets.train, dsets.valid, bs=[64, 128], batch_tfms=[TSStandardize()], num_workers=0)
+#model = InceptionTime(dls.vars, dls.c)
+#learn = Learner(dls, model, metrics=accuracy)
+#learn.fit_one_cycle(25, lr_max=1e-3)
+#learn.plot_metrics()
