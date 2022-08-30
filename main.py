@@ -1,7 +1,7 @@
 # Native
 import os
 import datetime
-import time
+import warnings
 
 # 3rd party
 import pandas as pd
@@ -9,6 +9,8 @@ import numpy as np
 import traces
 import pickle
 import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set_theme()
 import pandas as pd
 from tqdm import tqdm
 from sklearn.ensemble import RandomForestClassifier
@@ -20,53 +22,91 @@ from sklearn.metrics import *
 # Own
 from load_feather import *
 
-# Globals
-SAMPLING_INTERVAL_S = 0.05
-SAMPLING_INTERVAL_US = SAMPLING_INTERVAL_S * 1000000
+
+def get_common_time_bounds(list_of_df):
+    start_index = []
+    end_index = []
+    for dataframe in list_of_df[:-1]:
+        start_index.append(dataframe.index[0])
+        end_index.append(dataframe.index[-1])
+
+    return np.max(start_index), np.min(end_index)
 
 
-def generate_sliding_windows(in_data_df, length, stride, col_X, col_y, positive_subsampling=False):
+def calc_y(y_complete, win_beg_bound, win_end_bound, acceptance_amount):
+    # Get values for boundary
+    win_beg_index = y_complete.index.searchsorted(pd.Timestamp(win_beg_bound), side='left') - 1
+    win_end_index = y_complete.index.searchsorted(pd.Timestamp(win_end_bound), side='right') + 1
+
+    # Cut boundary from complete df
+    y_cut = y_complete.iloc[win_beg_index: win_end_index]
+
+    return perc_y_true(y_cut.direction.values, acceptance_amount)
+
+def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsampling=False, norm_mag=False, use_diff=False):
+    # Get time bounds
+    start_time, end_time = get_common_time_bounds(in_data)
+
     # Generate window bounds
-    win_beg_bounds = np.arange(0, len(in_data_df) - length, stride)
-    win_end_bounds = win_beg_bounds + length
+    # TODO: Add stride from parameter
+    win_beg_bounds = pd.date_range(start = start_time, end = end_time - pd.Timedelta(value=length, unit='s'),
+                                   freq = str(stride) + 'S').values
+    win_end_bounds = pd.date_range(start = start_time + pd.Timedelta(value=length, unit='s'), end = end_time,
+                                   freq = str(stride) + 'S').values
 
     # Empty X and y for Output
     X = []
     y = []
 
-    # Create norm of magnetometer
-    in_data_df['magnetic_field_sensor_0_norm'] = np.linalg.norm(in_data_df[['magnetic_field_sensor_0_x',
-                                                                            'magnetic_field_sensor_0_y',
-                                                                            'magnetic_field_sensor_0_z']].values,
-                                                                axis=1)
-    col_X = [X for X in col_X if 'magnetic_field_sensor' not in X]
-    col_X.append('magnetic_field_sensor_0_norm')
-
     # Iterate over all window positions
     for win_beg_bound, win_end_bound in zip(win_beg_bounds, win_end_bounds):
-        # Window of x and y columns
-        win_X = dataframe.iloc[win_beg_bound:win_end_bound][col_X]
-        win_y = dataframe.iloc[win_beg_bound:win_end_bound][col_y]
+        tmp_X = []
 
-        # Create y value from window
-        curr_y = perc_y_true(win_y.values, 0.1)
+        # Window for X
+        for df, key in zip(in_data[:-1], use_keys.keys()):
+            if key == 'magnetic_field_sensor_0' and norm_mag:
+                df['norm'] = np.linalg.norm(df[['x','y', 'z']].values, axis=1)
+                df = df.drop(['x','y', 'z'], axis=1)
+
+            # Get samples for timeframe
+            df_filtered = df.loc[(df.index > win_beg_bound) & (df.index <= win_end_bound)]
+
+            # Create features from window X
+            tmp_X.extend(df_filtered.describe().drop('count').values.ravel(order='F'))
+
+        # Append to X collector
+        X.append(tmp_X)
+
+        # Window of y columns
+        curr_y = calc_y(in_data[-1][-1].resample('100L').bfill(), win_beg_bound, win_end_bound, 0.1)
         y.append(curr_y)
 
-        # Create features from window X
-        X.append(win_X.describe().drop('count').values.ravel(order='F'))
-
+        # Makes halve stride length move and adds that X as well
         if positive_subsampling and curr_y in [0, 1]:
             # Add another y
             y.append(curr_y)
 
             # Shift window by halve stride
-            win_beg_bound += int(stride / 2)
-            win_end_bound += int(stride / 2)
+            win_beg_bound += pd.Timedelta(stride/2, unit='s')
+            win_end_bound += pd.Timedelta(stride/2, unit='s')
 
-            win_X = dataframe.iloc[win_beg_bound:win_end_bound][col_X]
-            X.append(win_X.describe().drop('count').values.ravel(order='F'))
+            tmp_X = []
+            # Window for X
+            for df, sub_key in zip(in_data[:-1], use_keys.keys()):
+                if sub_key == 'magnetic_field_sensor_0' and norm_mag:
+                    df['norm'] = np.linalg.norm(df[['x', 'y', 'z']].values, axis=1)
+                    df = df.drop(['x', 'y', 'z'], axis=1)
 
-    return np.array(X), np.array(y)
+                # Get samples for timeframe
+                df_filtered = df.loc[(df.index > win_beg_bound) & (df.index <= win_end_bound)]
+
+                # Create features from window X
+                tmp_X.extend(df_filtered.describe().drop('count').values.ravel(order='F'))
+
+            # Append to X collector
+            X.append(tmp_X)
+
+    return np.array(X), np.array(y), len(X)
 
 
 def balance_to_middle_class(X, y):
@@ -99,7 +139,7 @@ def balance_to_middle_class(X, y):
     return np.vstack(X_result_list), np.hstack(y_result_list)
 
 
-def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag):
+def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag, end_bag):
     # Trim to relevant entries
     encounter_db = encounter_db[encounter_db["bag_file"] == bagfile]
     encounter_db = encounter_db[encounter_db["is_encounter"] == True]
@@ -116,10 +156,17 @@ def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag):
             continue
 
         # Add begin
-        encounter_list.append([pd.to_datetime(line['begin'], unit='s'), 1, line['direction']])
+        begin_ts = pd.to_datetime(line['begin'], unit='s')
+        encounter_list.append([begin_ts - pd.Timedelta(1,unit='ns'), 0, -1])
+        encounter_list.append([begin_ts, 1, line['direction']])
 
         # Add end
-        encounter_list.append([pd.to_datetime(line['end'], unit='s'), 0, -1])
+        end_ts = pd.to_datetime(line['end'], unit='s')
+        encounter_list.append([end_ts - pd.Timedelta(1,unit='ns'), 1, line['direction']])
+        encounter_list.append([end_ts, 0, -1])
+
+    # Add final datapoint
+    encounter_list.append([end_bag, 0, -1])
 
     # Make to pandas
     encounter_ground_truth = pd.DataFrame(encounter_list, columns=['timestamp_bagfile', 'ground_truth', 'direction'])
@@ -279,16 +326,15 @@ if __name__ == "__main__":
     trajectory_db = pd.read_feather(os.path.join(working_dir, 'trajectory_db.feather'))
 
     # Hyperparameters
-    window_length = 150
-    window_stride = 15
+    window_length = 7.5
+    window_stride = 0.75
+    norm_of_magnetometer = False
+    use_diff = True
 
     sensor_keys = ['magnetic_field_sensor_0', 'pressure_sensor_0']
     columns_X = ['magnetic_field_sensor_0_x', 'magnetic_field_sensor_0_y', 'magnetic_field_sensor_0_z', 'pressure_sensor_0_fluid_pressure']
     columns_y = ['ground_truth_direction']
-
-    use_savepoint_resample = False
-    create_savepoint_resample = True
-    savepoint_resample = 'sp_resample_1.pickle'
+    use_keys = dict(magnetic_field_sensor_0=['x', 'y', 'z'], pressure_sensor_0=['fluid_pressure'])
 
     use_savepoint_window = False
     create_savepoint_window = True
@@ -298,46 +344,42 @@ if __name__ == "__main__":
     create_savepoint_classifier = True
     savepoint_classifier = 'sp_classifier_1.pickle'
 
-    # RESAMPLING -------------------------------------------------------------------------------------------------------
-    # Switch between cases depending on flag state
-    if not use_savepoint_resample:
-        # Create empty list
-        resampled_data = []
+    # LOAD DATA --------------------------------------------------------------------------------------------------------
+    bag_list = []
+    for counter, bagfile_name in enumerate(tqdm(trajectory_db.name.values)):
+        #print(bagfile_name[:-4])
 
-        # Iterate over all bagfiles
-        for counter, bagfile_name in enumerate(trajectory_db.name.values):
-            print(bagfile_name[:-4])
+        # Load bagfile
+        bagfile_path = os.path.join(working_dir, bagfile_name[:-4])
+        bag_pandas = Data_As_Pandas(bagfile_path)
+        bag_pandas.load_from_working_directory()
 
-            # Load bagfile
-            bagfile_path = os.path.join(working_dir, bagfile_name[:-4])
-            bag_pandas = Data_As_Pandas(bagfile_path)
-            bag_pandas.load_from_working_directory()
+        # Get ground truth for current bagfile and
+        encounter_ground_truth = generate_timeseries_true_positives(encounter_db, os.path.split(bagfile_path)[-1], pd.to_datetime(bag_pandas.overview['general_meta']['start_time_unix'], unit='s'), pd.to_datetime(bag_pandas.overview['general_meta']['end_time_unix'], unit='s'))
 
-            # Get ground truth for current bagfile and
-            encounter_ground_truth = generate_timeseries_true_positives(encounter_db, os.path.split(bagfile_path)[-1], pd.to_datetime(bag_pandas.overview['general_meta']['start_time_unix']))
+        # Put data into list for further processing
+        df_list = []
+        for sensor_key in use_keys.keys():
+            df_list.append(correct_with_phone_times(bag_pandas.dataframes[sensor_key].dataframe))
 
-            # Resample chosen sensors and fuse in one dataframe
-            sensors_resampled = resample_bagfile(bag_pandas, sensor_keys, encounter_ground_truth)
-            resampled_data_df = pd.concat(sensors_resampled, axis=1)
-            resampled_data_df.columns = resampled_data_df.columns.map('_'.join).str.strip('_')
-            resampled_data.append(resampled_data_df)
-
-        if create_savepoint_resample:
-            with open(savepoint_resample, 'wb') as handle:
-                pickle.dump(resampled_data, handle)
-
-    else:
-        resampled_data = pickle.load(open(savepoint_resample, 'rb'))
+        # Add weather info for additional stats
+        df_list.append(bag_pandas.overview['weather']['hourly'] + [encounter_ground_truth])
+        bag_list.append(df_list)
 
     # SLIDING WINDOW ---------------------------------------------------------------------------------------------------
     # Switch between cases depending on flag state
     if not use_savepoint_window:
-        collector_X = np.empty((0, 14))
+        if norm_of_magnetometer:
+            parameter = 14
+        else:
+            parameter = 28
+
+        collector_X = np.empty((0, parameter))
         collector_y = np.empty((0))
 
-        for dataframe in tqdm(resampled_data):
+        for df_list in tqdm(bag_list):
             # Generate windows
-            X, y = generate_sliding_windows(dataframe, window_length, window_stride, columns_X, columns_y, positive_subsampling=True)
+            X, y, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff)
             # working: 150/25; 100/10
 
             # Concat to existing array
