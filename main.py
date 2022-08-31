@@ -41,7 +41,13 @@ def calc_y(y_complete, win_beg_bound, win_end_bound, acceptance_amount):
     # Cut boundary from complete df
     y_cut = y_complete.iloc[win_beg_index: win_end_index]
 
-    return perc_y_true(y_cut.direction.values, acceptance_amount)
+    # Calc y value
+    y_value = perc_y_true(y_cut.direction.values, acceptance_amount)
+
+    # Get Distance for y-value
+    z_value = np.average(y_cut[y_cut.direction == y_value].distance.values)
+
+    return y_value, z_value
 
 def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsampling=False, norm_mag=False, use_diff=False):
     # Get time bounds
@@ -57,6 +63,7 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
     # Empty X and y for Output
     X = []
     y = []
+    z = []
 
     # Iterate over all window positions
     for win_beg_bound, win_end_bound in zip(win_beg_bounds, win_end_bounds):
@@ -78,13 +85,15 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
         X.append(tmp_X)
 
         # Window of y columns
-        curr_y = calc_y(in_data[-1][-1].resample('100L').bfill(), win_beg_bound, win_end_bound, 0.1)
+        curr_y, curr_z = calc_y(in_data[-1][-1].resample('100L').bfill(), win_beg_bound, win_end_bound, 0.1)
         y.append(curr_y)
+        z.append(curr_z)
 
         # Makes halve stride length move and adds that X as well
         if positive_subsampling and curr_y in [0, 1]:
             # Add another y
             y.append(curr_y)
+            z.append(curr_z)
 
             # Shift window by halve stride
             win_beg_bound += pd.Timedelta(stride/2, unit='s')
@@ -106,7 +115,7 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
             # Append to X collector
             X.append(tmp_X)
 
-    return np.array(X), np.array(y), len(X)
+    return np.array(X), np.array(y), np.array(z), len(X)
 
 
 def balance_to_middle_class(X, y):
@@ -148,7 +157,7 @@ def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag, end_bag
     encounter_list = []
 
     #Add initial datapoint
-    encounter_list.append([begin_bag, 0, -1])
+    encounter_list.append([begin_bag, 0, -1, np.nan])
 
     for counter, line in encounter_db.iterrows():
         # TODO: fix issue of zero duration encounters
@@ -157,19 +166,19 @@ def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag, end_bag
 
         # Add begin
         begin_ts = pd.to_datetime(line['begin'], unit='s')
-        encounter_list.append([begin_ts - pd.Timedelta(1,unit='ns'), 0, -1])
-        encounter_list.append([begin_ts, 1, line['direction']])
+        encounter_list.append([begin_ts - pd.Timedelta(1,unit='ns'), 0, -1, np.nan])
+        encounter_list.append([begin_ts, 1, line['direction'], line['distance']])
 
         # Add end
         end_ts = pd.to_datetime(line['end'], unit='s')
-        encounter_list.append([end_ts - pd.Timedelta(1,unit='ns'), 1, line['direction']])
-        encounter_list.append([end_ts, 0, -1])
+        encounter_list.append([end_ts - pd.Timedelta(1,unit='ns'), 1, line['direction'], line['distance']])
+        encounter_list.append([end_ts, 0, -1, np.nan])
 
     # Add final datapoint
-    encounter_list.append([end_bag, 0, -1])
+    encounter_list.append([end_bag, 0, -1, np.nan])
 
     # Make to pandas
-    encounter_ground_truth = pd.DataFrame(encounter_list, columns=['timestamp_bagfile', 'ground_truth', 'direction'])
+    encounter_ground_truth = pd.DataFrame(encounter_list, columns=['timestamp_bagfile', 'ground_truth', 'direction', 'distance'])
     encounter_ground_truth.set_index('timestamp_bagfile', inplace=True)
 
     return encounter_ground_truth
@@ -376,24 +385,26 @@ if __name__ == "__main__":
 
         collector_X = np.empty((0, parameter))
         collector_y = np.empty((0))
+        collector_z = np.empty((0))
 
         for df_list in tqdm(bag_list):
             # Generate windows
-            X, y, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff)
+            X, y, z, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff)
             # working: 150/25; 100/10
 
             # Concat to existing array
             collector_X = np.concatenate((collector_X, X), axis=0)
             collector_y = np.concatenate((collector_y, y), axis=0)
+            collector_z = np.concatenate((collector_z, z), axis=0)
 
             if create_savepoint_window:
                 with open(savepoint_window, 'wb') as handle:
-                    pickle.dump((columns_X, columns_y), handle)
+                    pickle.dump((collector_X, collector_y, collector_z), handle)
 
     else:
-        collector_X, collector_y = pickle.load(open(savepoint_window, 'rb'))
+        collector_X, collector_y, collector_z = pickle.load(open(savepoint_window, 'rb'))
 
-    X_train, X_test, y_train, y_test = train_test_split(collector_X, collector_y, test_size=0.2, random_state=0,
+    X_train, X_test, y_train, y_test, z_train, z_test = train_test_split(collector_X, collector_y, collector_z, test_size=0.2, random_state=0,
                                                         shuffle=True)
 
     X_train_balanced, y_train_balanced = balance_to_middle_class(X_train, y_train)
