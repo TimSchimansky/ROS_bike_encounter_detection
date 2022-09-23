@@ -2,6 +2,7 @@
 import os
 import datetime
 import warnings
+import random
 
 # 3rd party
 import pandas as pd
@@ -18,6 +19,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample, shuffle
 from sklearn.metrics import *
+from scipy.fft import fft, fftfreq
 
 # Own
 from load_feather import *
@@ -49,7 +51,20 @@ def calc_y(y_complete, win_beg_bound, win_end_bound, acceptance_amount):
 
     return y_value, z_value
 
-def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsampling=False, norm_mag=False, use_diff=False):
+
+def calf_fft_window(window_df):
+    N = len(window_df)
+    T = np.mean(np.diff(window_df.index.values).astype(float)*1e-9)
+
+    x = np.linspace(0.0, N * T, N, endpoint=False)
+    y = window_df.values
+
+    yf = fft(y)
+    xf = fftfreq(N, T)[:N // 2]
+
+    print(1)
+
+def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsampling=False, norm_mag=False, use_diff=False, reduce=False, xy_only_mag=True):
     # Get time bounds
     start_time, end_time = get_common_time_bounds(in_data)
 
@@ -69,25 +84,39 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
     for win_beg_bound, win_end_bound in zip(win_beg_bounds, win_end_bounds):
         tmp_X = []
 
+        if not reduce:
+            drop_list = 'count'
+        else:
+            drop_list = ['count', '25%', '50%', '75%']
+
         # Window for X
         for df, key in zip(in_data[:-1], use_keys.keys()):
             if key == 'magnetic_field_sensor_0' and norm_mag:
                 df['norm'] = np.linalg.norm(df[['x','y', 'z']].values, axis=1)
                 df = df.drop(['x','y', 'z'], axis=1)
 
+            if key == 'magnetic_field_sensor_0' and xy_only_mag:
+                df = df.drop(['z'], axis=1)
+
             # Get samples for timeframe
             df_filtered = df.loc[(df.index > win_beg_bound) & (df.index <= win_end_bound)]
 
             # Create features from window X
-            tmp_X.extend(df_filtered.describe().drop('count').values.ravel(order='F'))
+            tmp_X.extend(df_filtered.describe().drop(drop_list).values.ravel(order='F'))
+
+            if use_diff:
+                tmp_X.extend(df_filtered.diff().describe().drop(drop_list).values.ravel(order='F'))
 
         # Append to X collector
         X.append(tmp_X)
 
         # Window of y columns
-        curr_y, curr_z = calc_y(in_data[-1][-1].resample('100L').bfill(), win_beg_bound, win_end_bound, 0.1)
+        curr_y, curr_z = calc_y(in_data[-1][-1].resample('100L').bfill(), win_beg_bound, win_end_bound, 0.5)
         y.append(curr_y)
         z.append(curr_z)
+
+        #if curr_y in [0, 1]:
+        #    calf_fft_window(df)
 
         # Makes halve stride length move and adds that X as well
         if positive_subsampling and curr_y in [0, 1]:
@@ -106,11 +135,17 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
                     df['norm'] = np.linalg.norm(df[['x', 'y', 'z']].values, axis=1)
                     df = df.drop(['x', 'y', 'z'], axis=1)
 
+                if sub_key == 'magnetic_field_sensor_0' and xy_only_mag:
+                    df = df.drop(['z'], axis=1)
+
                 # Get samples for timeframe
                 df_filtered = df.loc[(df.index > win_beg_bound) & (df.index <= win_end_bound)]
 
                 # Create features from window X
-                tmp_X.extend(df_filtered.describe().drop('count').values.ravel(order='F'))
+                tmp_X.extend(df_filtered.describe().drop(drop_list).values.ravel(order='F'))
+
+                if use_diff:
+                    tmp_X.extend(df_filtered.diff().describe().drop(drop_list).values.ravel(order='F'))
 
             # Append to X collector
             X.append(tmp_X)
@@ -324,7 +359,7 @@ def perc_y_true(y_tmp, percentage):
 if __name__ == "__main__":
     # -------------------------------------------------------------------------------
     # Set working directory
-    working_dir = 'H:/bagfiles_unpack/'
+    working_dir = 'G:/bagfiles_unpack/'
 
     # Get detected encounters
     encounter_db = pd.read_feather(os.path.join(working_dir, 'encounter_db_v2_backup_after_manual.feather'))
@@ -335,10 +370,12 @@ if __name__ == "__main__":
     trajectory_db = pd.read_feather(os.path.join(working_dir, 'trajectory_db.feather'))
 
     # Hyperparameters
-    window_length = 7.5
-    window_stride = 0.75
+    window_length = 5
+    window_stride = 0.5
     norm_of_magnetometer = False
-    use_diff = True
+    only_xy_magnetometer = False
+    use_diff = False
+    reduce = False
 
     sensor_keys = ['magnetic_field_sensor_0', 'pressure_sensor_0']
     columns_X = ['magnetic_field_sensor_0_x', 'magnetic_field_sensor_0_y', 'magnetic_field_sensor_0_z', 'pressure_sensor_0_fluid_pressure']
@@ -354,43 +391,57 @@ if __name__ == "__main__":
     savepoint_classifier = 'sp_classifier_1.pickle'
 
     # LOAD DATA --------------------------------------------------------------------------------------------------------
-    bag_list = []
-    for counter, bagfile_name in enumerate(tqdm(trajectory_db.name.values)):
-        #print(bagfile_name[:-4])
+    if not use_savepoint_window:
+        bag_list = []
+        for counter, bagfile_name in enumerate(tqdm(trajectory_db.name.values)):
+            #print(bagfile_name[:-4])
 
-        # Load bagfile
-        bagfile_path = os.path.join(working_dir, bagfile_name[:-4])
-        bag_pandas = Data_As_Pandas(bagfile_path)
-        bag_pandas.load_from_working_directory()
+            # Load bagfile
+            bagfile_path = os.path.join(working_dir, bagfile_name[:-4])
+            bag_pandas = Data_As_Pandas(bagfile_path)
+            bag_pandas.load_from_working_directory()
 
-        # Get ground truth for current bagfile and
-        encounter_ground_truth = generate_timeseries_true_positives(encounter_db, os.path.split(bagfile_path)[-1], pd.to_datetime(bag_pandas.overview['general_meta']['start_time_unix'], unit='s'), pd.to_datetime(bag_pandas.overview['general_meta']['end_time_unix'], unit='s'))
+            # Get ground truth for current bagfile and
+            encounter_ground_truth = generate_timeseries_true_positives(encounter_db, os.path.split(bagfile_path)[-1], pd.to_datetime(bag_pandas.overview['general_meta']['start_time_unix'], unit='s'), pd.to_datetime(bag_pandas.overview['general_meta']['end_time_unix'], unit='s'))
 
-        # Put data into list for further processing
-        df_list = []
-        for sensor_key in use_keys.keys():
-            df_list.append(correct_with_phone_times(bag_pandas.dataframes[sensor_key].dataframe))
+            # Put data into list for further processing
+            df_list = []
+            for sensor_key in use_keys.keys():
+                df_list.append(correct_with_phone_times(bag_pandas.dataframes[sensor_key].dataframe))
 
-        # Add weather info for additional stats
-        df_list.append(bag_pandas.overview['weather']['hourly'] + [encounter_ground_truth])
-        bag_list.append(df_list)
+            # Add weather info for additional stats
+            df_list.append(bag_pandas.overview['weather']['hourly'] + [encounter_ground_truth])
+            bag_list.append(df_list)
+
+        random.shuffle(bag_list)
 
     # SLIDING WINDOW ---------------------------------------------------------------------------------------------------
     # Switch between cases depending on flag state
     if not use_savepoint_window:
         if norm_of_magnetometer:
             parameter = 14
+        elif only_xy_magnetometer:
+            parameter = 21
         else:
             parameter = 28
+
+        if use_diff:
+            parameter = parameter * 2
+
+        if reduce:
+            parameter = int(parameter * 4/7)
 
         collector_X = np.empty((0, parameter))
         collector_y = np.empty((0))
         collector_z = np.empty((0))
 
-        for df_list in tqdm(bag_list):
+        for counter_i, df_list in tqdm(enumerate(bag_list)):
             # Generate windows
-            X, y, z, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff)
+            X, y, z, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff, reduce=reduce, xy_only_mag=only_xy_magnetometer)
             # working: 150/25; 100/10
+
+            if X.shape[0] == 0:
+                continue
 
             # Concat to existing array
             collector_X = np.concatenate((collector_X, X), axis=0)
@@ -404,8 +455,10 @@ if __name__ == "__main__":
     else:
         collector_X, collector_y, collector_z = pickle.load(open(savepoint_window, 'rb'))
 
-    X_train, X_test, y_train, y_test, z_train, z_test = train_test_split(collector_X, collector_y, collector_z, test_size=0.2, random_state=0,
-                                                        shuffle=True)
+    # Use mono
+    #collector_y = np.clip(collector_y + 1, 0, 1)
+
+    X_train, X_test, y_train, y_test, z_train, z_test = train_test_split(collector_X, collector_y, collector_z, test_size=0.2, random_state=0, shuffle=False)
 
     X_train_balanced, y_train_balanced = balance_to_middle_class(X_train, y_train)
     X_train_balanced, y_train_balanced = shuffle(X_train_balanced, y_train_balanced, random_state=0)
@@ -414,13 +467,14 @@ if __name__ == "__main__":
     X_train_balanced = sc.fit_transform(X_train_balanced)
     X_test = sc.transform(X_test)
 
-    clf = RandomForestClassifier(max_depth=10, random_state=0, n_estimators=20)
+    #clf = RandomForestClassifier(random_state=0, n_estimators=1000)
+    clf = RandomForestClassifier()
     clf.fit(X_train_balanced, y_train_balanced)
 
     o = clf.predict(X_test)
 
     print("Klassifikationsreport")
-    print(classification_report(y_test, o))
+    print(classification_report(y_test, o, digits=3))
     print("Konfusionsmatrix")
     print(confusion_matrix(y_test, o))
     print("Feature Wichtigkeit")
@@ -429,5 +483,8 @@ if __name__ == "__main__":
     """plt.plot(o, alpha=0.5)
     plt.plot(y_test, alpha=0.5)
     plt.show()"""
+
+    with open(f'all_{window_length}_{window_stride}_fft.pickle', 'wb') as handle:
+        pickle.dump((collector_X, collector_y, collector_z, clf, X_train, X_test, y_train, y_test, o, z_train, z_test, sc, SCORERS), handle)
 
     print(1)
