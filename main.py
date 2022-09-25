@@ -21,6 +21,9 @@ from sklearn.utils import resample, shuffle
 from sklearn.metrics import *
 from scipy.fft import fft, fftfreq
 
+from sklearn.experimental import enable_halving_search_cv  # noqa
+from sklearn.model_selection import RandomizedSearchCV
+
 # Own
 from load_feather import *
 
@@ -52,17 +55,71 @@ def calc_y(y_complete, win_beg_bound, win_end_bound, acceptance_amount):
     return y_value, z_value
 
 
-def calf_fft_window(window_df):
-    N = len(window_df)
-    T = np.mean(np.diff(window_df.index.values).astype(float)*1e-9)
 
-    x = np.linspace(0.0, N * T, N, endpoint=False)
-    y = window_df.values
 
-    yf = fft(y)
-    xf = fftfreq(N, T)[:N // 2]
+def generate_static_windows(in_data, use_keys, num_sub_windows):
+    # Get time bounds
+    start_time, end_time = get_common_time_bounds(in_data)
 
-    print(1)
+    # Average lenght of all encounters in s
+    len_encounter = 3.3
+
+    # Generate window bounds
+    index_beg = np.arange(0,len(in_data[-1][-1]),2)
+    index_end = np.arange(0,len(in_data[-1][-1]),2) + 1
+
+    timestamps = in_data[-1][-1].iloc[index_beg].index + (in_data[-1][-1].iloc[index_end].index - in_data[-1][-1].iloc[index_beg].index) / 2
+    directions = in_data[-1][-1].iloc[index_beg].direction.values
+    distances = in_data[-1][-1].iloc[index_beg].distance.values
+
+    # Empty X and y for Output
+    X = []
+    y = []
+    z = []
+
+    for center_time, y_raw, z_value in zip(timestamps, directions, distances):
+        # Calc offset for begin of range
+        time_offset = pd.Timedelta(3.3, unit='s')*num_sub_windows/2
+
+        if center_time - time_offset < start_time or center_time + time_offset > end_time:
+            continue
+
+        # Calculate time bounds for sub_windows
+        time_range = pd.date_range(start=center_time - time_offset, freq='3300ms', periods=num_sub_windows + 1)
+
+        X.append(generate_features_subwindow(in_data, time_range, use_keys))
+
+        y.append(y_raw)
+        z.append(z_value)
+
+    return np.array(X), np.array(y), np.array(z)
+
+
+def generate_features_subwindow(in_data, time_range, use_keys):
+    # Create empty list for appending features to
+    X_tmp =[]
+
+    # Iterate over all windows in time_range
+    for sub_win_beg, sub_win_end in zip(time_range, time_range[1:]):
+        for df, key in zip(in_data[:-1], use_keys.keys()):
+            df_crop = df.loc[(df.index > sub_win_beg) & (df.index <= sub_win_end)]
+
+            X_tmp.extend(list(feature_set_1(df_crop)))
+
+    return X_tmp
+
+
+def feature_set_1(df_cropped):
+    drop_list = ['count', '25%', '50%', '75%']
+
+    return df_cropped.describe().drop(drop_list).values.ravel(order='F')
+
+
+def feature_set_2(df_cropped):
+    drop_list = ['count', '25%', '50%', '75%', 'min', 'max']
+
+    return df_cropped.describe().drop(drop_list).values.ravel(order='F')
+
 
 def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsampling=False, norm_mag=False, use_diff=False, reduce=False, xy_only_mag=True):
     # Get time bounds
@@ -155,7 +212,7 @@ def generate_sliding_windows(in_data, length, stride, use_keys, positive_subsamp
 
 def balance_to_middle_class(X, y):
     # Determine occurance of class with medium most values
-    destination_value = int(np.median(np.unique(y, return_counts=True)[1]))
+    destination_value = int(np.min(np.unique(y, return_counts=True)[1]))
     print(f"All classes are resampled to {destination_value} samples")
 
     X_result_list = []
@@ -193,7 +250,6 @@ def generate_timeseries_true_positives(encounter_db, bagfile, begin_bag, end_bag
 
     #Add initial datapoint
     encounter_list.append([begin_bag, 0, -1, np.nan])
-
     for counter, line in encounter_db.iterrows():
         # TODO: fix issue of zero duration encounters
         if line['end'] == line['begin']:
@@ -366,12 +422,18 @@ if __name__ == "__main__":
     encounter_db = encounter_db.sort_values("begin")
     encounter_db = encounter_db.drop_duplicates(subset=["begin", "end"])
 
+    # Get detected encounters
+    encounter_db_auto = pd.read_feather(os.path.join(working_dir, 'encounter_db_v2_backup_pre_manual.feather'))
+    encounter_db_auto = encounter_db_auto.sort_values("begin")
+    encounter_db_auto = encounter_db_auto.drop_duplicates(subset=["begin", "end"])
+    encounter_db_auto.loc[encounter_db_auto.description.isin(['bicycle', 'motorcycle', 'person', 'train']), 'direction'] = -1
+
     # Get trajectories
     trajectory_db = pd.read_feather(os.path.join(working_dir, 'trajectory_db.feather'))
 
     # Hyperparameters
     window_length = 5
-    window_stride = 0.5
+    window_stride = 1
     norm_of_magnetometer = False
     only_xy_magnetometer = False
     use_diff = False
@@ -423,6 +485,7 @@ if __name__ == "__main__":
         elif only_xy_magnetometer:
             parameter = 21
         else:
+            #parameter = 16 * 3
             parameter = 28
 
         if use_diff:
@@ -437,6 +500,7 @@ if __name__ == "__main__":
 
         for counter_i, df_list in tqdm(enumerate(bag_list)):
             # Generate windows
+            #X, y, z = generate_static_windows(df_list, use_keys, 3)
             X, y, z, X_shape = generate_sliding_windows(df_list, window_length, window_stride, use_keys, positive_subsampling=True, norm_mag=norm_of_magnetometer, use_diff=use_diff, reduce=reduce, xy_only_mag=only_xy_magnetometer)
             # working: 150/25; 100/10
 
@@ -458,7 +522,7 @@ if __name__ == "__main__":
     # Use mono
     #collector_y = np.clip(collector_y + 1, 0, 1)
 
-    X_train, X_test, y_train, y_test, z_train, z_test = train_test_split(collector_X, collector_y, collector_z, test_size=0.2, random_state=0, shuffle=False)
+    X_train, X_test, y_train, y_test, z_train, z_test = train_test_split(collector_X, collector_y, collector_z, test_size=0.2, random_state=0, shuffle=True)
 
     X_train_balanced, y_train_balanced = balance_to_middle_class(X_train, y_train)
     X_train_balanced, y_train_balanced = shuffle(X_train_balanced, y_train_balanced, random_state=0)
@@ -467,8 +531,20 @@ if __name__ == "__main__":
     X_train_balanced = sc.fit_transform(X_train_balanced)
     X_test = sc.transform(X_test)
 
-    #clf = RandomForestClassifier(random_state=0, n_estimators=1000)
+    """param_grid = {'max_depth': [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, None], 'min_samples_split': [2, 5, 10], 'n_estimators': [200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000]}
     clf = RandomForestClassifier()
+
+    sh = RandomizedSearchCV(clf, param_grid, n_iter = 100, cv = 3, verbose=2, random_state=42, n_jobs = -1).fit(X_train_balanced, y_train_balanced)
+
+    print(sh.best_estimator_)"""
+
+    # Subwindow stuff
+    #clf = RandomForestClassifier(max_depth=5, min_samples_split=10, n_estimators=200)
+
+    # Sliding window stuff
+    clf = RandomForestClassifier(max_depth=40, n_estimators=200)
+
+
     clf.fit(X_train_balanced, y_train_balanced)
 
     o = clf.predict(X_test)
@@ -477,6 +553,8 @@ if __name__ == "__main__":
     print(classification_report(y_test, o, digits=3))
     print("Konfusionsmatrix")
     print(confusion_matrix(y_test, o))
+    print('Anzahl genutzter Features:')
+    print(parameter)
     print("Feature Wichtigkeit")
     print(clf.feature_importances_)
 
@@ -484,7 +562,7 @@ if __name__ == "__main__":
     plt.plot(y_test, alpha=0.5)
     plt.show()"""
 
-    with open(f'all_{window_length}_{window_stride}_fft.pickle', 'wb') as handle:
-        pickle.dump((collector_X, collector_y, collector_z, clf, X_train, X_test, y_train, y_test, o, z_train, z_test, sc, SCORERS), handle)
+    """with open(os.path.join('matrix_classic', f'all_{window_length}_{window_stride}_basic.pickle'), 'wb') as handle:
+        pickle.dump((collector_X, collector_y, collector_z, clf, X_train, X_test, y_train, y_test, o, z_train, z_test, sc, SCORERS), handle)"""
 
     print(1)
